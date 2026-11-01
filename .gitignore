@@ -1,0 +1,9 @@
+*.csv
+*.png
+cos711_a2.py
+inference.py
+validation_set_generation.py
+filament-segmentation-2026/
+__pycache__/
+checkpoints/0111_models/
+evaluate.py

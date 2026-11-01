@@ -24,6 +24,8 @@ import torch
 import os
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, random_split
+from sklearn.model_selection import GroupShuffleSplit
+from torch.utils.data import Subset
 # from google.colab import drive
 # drive.mount('/content/drive')
 
@@ -143,13 +145,13 @@ class SolarFilamentDataset(Dataset):
     def __len__(self):
         return len(self.df)
 
+
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
 
         image_id = row['image_id']
         segmentation_polygons = row['segmentation_polygons']
 
-        # Derive actual image filename from image_id
         file_stem = image_id.split("-", 1)[1]
         file_name = file_stem + self.image_extension
         img_path = self.images_dir / file_name
@@ -157,16 +159,13 @@ class SolarFilamentDataset(Dataset):
         if not img_path.exists():
             raise FileNotFoundError(f"Image not found: {img_path}")
 
-        # Load image as grayscale
         image = Image.open(img_path).convert("L")
-        image = np.array(image)
+        # Divide by 255.0 so training scale matches inference scale (0.0 to 1.0)
+        image = np.array(image, dtype=np.float32) / 255.0
 
         height, width = image.shape
 
-        # Parse segmentation polygons
         polygons = self._parse_polygons(segmentation_polygons)
-
-        # Create mask from polygons
         mask = self._create_mask_from_polygons(polygons, height, width)
 
         if self.transform:
@@ -176,12 +175,52 @@ class SolarFilamentDataset(Dataset):
         mask = torch.from_numpy(mask).long()
 
         return {
-            "image": image,           # shape: (1, H, W)
-            "mask": mask,             # shape: (H, W) - binary (0 or 1)
+            "image": image,
+            "mask": mask,
             "image_id": image_id,
             "file_name": file_name,
             "num_filaments": row['num_filaments']
         }
+
+    # def __getitem__(self, idx):
+    #     row = self.df.iloc[idx]
+
+    #     image_id = row['image_id']
+    #     segmentation_polygons = row['segmentation_polygons']
+
+    #     # Derive actual image filename from image_id
+    #     file_stem = image_id.split("-", 1)[1]
+    #     file_name = file_stem + self.image_extension
+    #     img_path = self.images_dir / file_name
+
+    #     if not img_path.exists():
+    #         raise FileNotFoundError(f"Image not found: {img_path}")
+
+    #     # Load image as grayscale
+    #     image = Image.open(img_path).convert("L")
+    #     image = np.array(image)
+
+    #     height, width = image.shape
+
+    #     # Parse segmentation polygons
+    #     polygons = self._parse_polygons(segmentation_polygons)
+
+    #     # Create mask from polygons
+    #     mask = self._create_mask_from_polygons(polygons, height, width)
+
+    #     if self.transform:
+    #         image = self.transform(image)
+
+    #     image = torch.from_numpy(image).unsqueeze(0).float()
+    #     mask = torch.from_numpy(mask).long()
+
+    #     return {
+    #         "image": image,           # shape: (1, H, W)
+    #         "mask": mask,             # shape: (H, W) - binary (0 or 1)
+    #         "image_id": image_id,
+    #         "file_name": file_name,
+    #         "num_filaments": row['num_filaments']
+    #     }
 
     def _parse_polygons(self, segmentation_polygons):
       """
@@ -237,6 +276,8 @@ class SolarFilamentDataset(Dataset):
 
         return mask
 
+
+
 def create_data_loaders(
     images_dir: str,
     annotations_csv: str,
@@ -246,46 +287,21 @@ def create_data_loaders(
     random_state: int = 42,
     image_extension: str = ".jpeg"
 ):
-    """
-    Create train and validation DataLoaders from CSV annotations.
-
-    Args:
-        images_dir: Path to images folder
-        annotations_csv: Path to CSV file (created separately with extract_annotations_to_csv)
-        batch_size: Batch size for training
-        num_workers: Number of DataLoader workers (0 for Colab)
-        val_split: Fraction of images for validation (default 0.2 = 20%)
-        random_state: Random seed for reproducibility
-        image_extension: Image file extension (e.g., ".jpeg", ".jpg")
-
-    Returns:
-        train_loader: DataLoader for training
-        val_loader: DataLoader for validation
-        train_dataset: Training dataset
-        val_dataset: Validation dataset
-    """
-    # Create full dataset from CSV
-    print(f"\nCreating dataset from CSV: {annotations_csv}")
     full_dataset = SolarFilamentDataset(
         images_dir=images_dir,
         annotations_csv=annotations_csv,
         image_extension=image_extension
     )
 
-    total_size = len(full_dataset)
-    val_size = int(total_size * val_split)
-    train_size = total_size - val_size
+    # Group split by base filename to prevent validation leakage
+    groups = full_dataset.df['image_id'].apply(lambda x: x.split("-", 1)[1]).values
+    gss = GroupShuffleSplit(n_splits=1, test_size=val_split, random_state=random_state)
+    train_idx, val_idx = next(gss.split(full_dataset.df, groups=groups))
 
-    # Use PyTorch's random_split
-    train_dataset, val_dataset = random_split(
-        full_dataset,
-        [train_size, val_size],
-        generator=torch.Generator().manual_seed(random_state)
-    )
-
+    train_dataset = Subset(full_dataset, train_idx)
+    val_dataset = Subset(full_dataset, val_idx)
 
     def collate_fn(batch):
-        """Collate function for DataLoader"""
         images = torch.stack([item["image"] for item in batch])
         masks = torch.stack([item["mask"] for item in batch])
         image_ids = [item["image_id"] for item in batch]
@@ -293,8 +309,8 @@ def create_data_loaders(
         num_filaments = [item["num_filaments"] for item in batch]
 
         return {
-            "images": images,           # (batch, 1, H, W)
-            "masks": masks,             # (batch, H, W)
+            "images": images,
+            "masks": masks,
             "image_ids": image_ids,
             "file_names": file_names,
             "num_filaments": num_filaments
@@ -319,6 +335,90 @@ def create_data_loaders(
     )
 
     return train_loader, val_loader, train_dataset, val_dataset
+# def create_data_loaders(
+#     images_dir: str,
+#     annotations_csv: str,
+#     batch_size: int = 4,
+#     num_workers: int = 0,
+#     val_split: float = 0.2,
+#     random_state: int = 42,
+#     image_extension: str = ".jpeg"
+# ):
+#     """
+#     Create train and validation DataLoaders from CSV annotations.
+
+#     Args:
+#         images_dir: Path to images folder
+#         annotations_csv: Path to CSV file (created separately with extract_annotations_to_csv)
+#         batch_size: Batch size for training
+#         num_workers: Number of DataLoader workers (0 for Colab)
+#         val_split: Fraction of images for validation (default 0.2 = 20%)
+#         random_state: Random seed for reproducibility
+#         image_extension: Image file extension (e.g., ".jpeg", ".jpg")
+
+#     Returns:
+#         train_loader: DataLoader for training
+#         val_loader: DataLoader for validation
+#         train_dataset: Training dataset
+#         val_dataset: Validation dataset
+#     """
+#     # Create full dataset from CSV
+#     print(f"\nCreating dataset from CSV: {annotations_csv}")
+#     full_dataset = SolarFilamentDataset(
+#         images_dir=images_dir,
+#         annotations_csv=annotations_csv,
+#         image_extension=image_extension
+#     )
+
+#     total_size = len(full_dataset)
+#     val_size = int(total_size * val_split)
+#     train_size = total_size - val_size
+
+#     Use PyTorch's random_split
+#     train_dataset, val_dataset = random_split(
+#         full_dataset,
+#         [train_size, val_size],
+#         generator=torch.Generator().manual_seed(random_state)
+#     )
+
+    
+
+
+#     def collate_fn(batch):
+#         """Collate function for DataLoader"""
+#         images = torch.stack([item["image"] for item in batch])
+#         masks = torch.stack([item["mask"] for item in batch])
+#         image_ids = [item["image_id"] for item in batch]
+#         file_names = [item["file_name"] for item in batch]
+#         num_filaments = [item["num_filaments"] for item in batch]
+
+#         return {
+#             "images": images,           # (batch, 1, H, W)
+#             "masks": masks,             # (batch, H, W)
+#             "image_ids": image_ids,
+#             "file_names": file_names,
+#             "num_filaments": num_filaments
+#         }
+
+#     train_loader = DataLoader(
+#         train_dataset,
+#         batch_size=batch_size,
+#         shuffle=True,
+#         num_workers=num_workers,
+#         collate_fn=collate_fn,
+#         pin_memory=True
+#     )
+
+#     val_loader = DataLoader(
+#         val_dataset,
+#         batch_size=batch_size,
+#         shuffle=False,
+#         num_workers=num_workers,
+#         collate_fn=collate_fn,
+#         pin_memory=True
+#     )
+
+#     return train_loader, val_loader, train_dataset, val_dataset
 
 df = extract_annotations_to_csv(
     annotations_file= JSON_PATH,
@@ -336,8 +436,9 @@ train_loader, val_loader, train_dataset, val_dataset = create_data_loaders(
 # pip install segmentation_models_pytorch
 
 class FilamentUNet(nn.Module):
-    """SMP U-Net wrapper with integrated Dice + BCE loss computation."""
-    def __init__(self, encoder_name="tu-convnext_base"):
+    """SMP U-Net with class-balanced Dice + BCE loss."""
+    
+    def __init__(self, encoder_name="resnet34", pos_weight=10.0):
         super().__init__()
         self.model = smp.Unet(
             encoder_name=encoder_name,
@@ -345,16 +446,18 @@ class FilamentUNet(nn.Module):
             in_channels=1,
             classes=1
         )
-
         self.dice_loss = smp.losses.DiceLoss(mode=smp.losses.BINARY_MODE, from_logits=True)
-        self.bce_loss = nn.BCEWithLogitsLoss()
-
+        # Penalize missing filament pixels 10x more than background pixels
+        self.pos_weight_val = pos_weight
+        self.bce_loss = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_weight]))
 
     def forward(self, x):
-      return self.model(x)
+        return self.model(x)
 
     def compute_loss(self, logits, targets):
-      return self.dice_loss(logits, targets)+self.bce_loss(logits, targets)
+        if self.bce_loss.pos_weight.device != logits.device:
+            self.bce_loss.pos_weight = self.bce_loss.pos_weight.to(logits.device)
+        return self.dice_loss(logits, targets) + self.bce_loss(logits, targets)
 
 import segmentation_models_pytorch as smp
 import torch.optim as optim
@@ -392,8 +495,6 @@ def train_model(
     train_loss = 0.0
     optimiser.zero_grad(set_to_none=True)
 
-    # for step, (images, masks) in enumerate (train_loader):
-    #   images, masks = images.to(device, non_blocking=True), masks.to(device, non_blocking=True)
     for step, batch in enumerate(train_loader):
       images = batch["images"].to(device, non_blocking=True)
       masks = batch["masks"].to(device, non_blocking=True).float()
@@ -419,17 +520,7 @@ def train_model(
 
     model.eval()
     val_loss = 0.0
-    # with torch.no_grad():
-    #         for images, masks in val_loader:
-    #             images, masks = images.to(device, non_blocking=True), masks.to(device, non_blocking=True)
 
-    #             with torch.amp.autocast('cuda', enabled=(device == "cuda"), dtype=torch.float16):
-    #                 logits = model(images)
-    #                 loss = model.compute_loss(logits, masks)
-
-    #             val_loss += loss.item()
-
-    # Replace line 65 in train_model:
     with torch.no_grad():
         for batch in val_loader:
             images = batch["images"].to(device, non_blocking=True)
@@ -455,6 +546,7 @@ def train_model(
         checkpoint_path = "checkpoints/best_unet.pth"
         torch.save(model.state_dict(), checkpoint_path)
         print(f"  --> Saved checkpoint: {checkpoint_path} (Val Loss: {best_val_loss:.4f})")
+
 
 
 if __name__ == "__main__":
